@@ -1,0 +1,62 @@
+# Merge dependabot patch/minor bumps automatically, but only AFTER CI has gone green.
+#
+# Why not `gh pr merge --auto`: this repo's plan has no branch protection (the API returns
+# "Upgrade to GitHub Pro"), so there are no *required* status checks. GitHub's auto-merge treats
+# "nothing required" as "merge now" and would land a bump before CI finished — the opposite of the
+# intent. So this job is triggered by CI *completing*, and merges only on success.
+#
+# Major bumps are never merged here: they need a human verdict (they have broken peers before —
+# pytest 9 conflicts with pytest-asyncio <1.0).
+name: Dependabot auto-merge
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = context.payload.workflow_run.head_branch;
+            const head = context.payload.workflow_run.head_sha;
+            const { owner, repo } = context.repo;
+
+            const prs = await github.rest.pulls.list({
+              owner, repo, state: 'open', head: `${owner}:${branch}`, per_page: 5,
+            });
+            const pr = prs.data[0];
+            if (!pr) { core.info(`no open PR for ${branch}`); return; }
+            if (pr.user.login !== 'dependabot[bot]') { core.info(`${pr.user.login} is not dependabot`); return; }
+
+            // "chore(deps): bump vite from 8.1.4 to 8.3.8" / "Bump pytest from 8.3.4 to 9.0.3"
+            const m = pr.title.match(/from\s+v?(\d+)\.(\d+)\.(\d+)\s+to\s+v?(\d+)\.(\d+)\.(\d+)/i);
+            if (!m) { core.info(`cannot parse versions from "${pr.title}"`); return; }
+            const [, aM, am, , bM, bm] = m.map(Number);
+            if (bM !== aM) { core.info(`major bump ${aM}->${bM}: needs a human verdict, skipping`); return; }
+            core.info(`patch/minor bump ${m[1]}.${m[2]}.${m[3]} -> ${m[4]}.${m[5]}.${m[6]}`);
+
+            // Everything that ran on this commit must be green (Migrations, other workflows).
+            const runs = await github.rest.checks.listForRef({ owner, repo, ref: head, per_page: 100 });
+            const bad = runs.data.check_runs.filter(c =>
+              !['success', 'neutral', 'skipped'].includes(c.conclusion) && c.name !== 'merge');
+            if (bad.length) { core.info(`not all checks green: ${bad.map(c => `${c.name}=${c.conclusion}`).join(', ')}`); return; }
+
+            const fresh = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+            if (fresh.data.mergeable !== true) { core.info(`PR #${pr.number} mergeable=${fresh.data.mergeable}`); return; }
+
+            await github.rest.pulls.merge({
+              owner, repo, pull_number: pr.number, merge_method: 'squash',
+            });
+            core.info(`merged #${pr.number}: ${pr.title}`);
