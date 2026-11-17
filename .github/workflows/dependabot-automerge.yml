@@ -53,8 +53,17 @@ jobs:
               !['success', 'neutral', 'skipped'].includes(c.conclusion) && c.name !== 'merge');
             if (bad.length) { core.info(`not all checks green: ${bad.map(c => `${c.name}=${c.conclusion}`).join(', ')}`); return; }
 
-            const fresh = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
-            if (fresh.data.mergeable !== true) { core.info(`PR #${pr.number} mergeable=${fresh.data.mergeable}`); return; }
+            // GitHub computes mergeability asynchronously and returns null for a few seconds after a
+            // push or a rerun. Polling beats giving up: a skipped bump is a bump that sits open,
+            // which is the exact pileup this job exists to stop.
+            let mergeable = null;
+            for (let i = 0; i < 6; i++) {
+              const fresh = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+              mergeable = fresh.data.mergeable;
+              if (mergeable !== null) break;
+              await new Promise(r => setTimeout(r, 10000));
+            }
+            if (mergeable !== true) { core.info(`PR #${pr.number} mergeable=${mergeable}; leaving it open`); return; }
 
             await github.rest.pulls.merge({
               owner, repo, pull_number: pr.number, merge_method: 'squash',
